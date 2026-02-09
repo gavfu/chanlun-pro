@@ -47,6 +47,12 @@ class ExchangeBinance(Exchange):
         # self.tz = pytz.timezone("Asia/Shanghai")
         self.tz = pytz.timezone(str(get_localzone()))
 
+    def _to_ccxt_symbol(self, code: str) -> str:
+        """将内部代码格式 (ETH/USDT) 转换为 ccxt binanceusdm 所需的格式 (ETH/USDT:USDT)"""
+        if ":" not in code:
+            return code + ":USDT"
+        return code
+
     def default_code(self):
         return "BTC/USDT"
 
@@ -232,7 +238,7 @@ class ExchangeBinance(Exchange):
                     params["endTime"] = current_end
                 # 获取K线数据
                 kline = self.exchange.fetch_ohlcv(
-                    symbol=code,
+                    symbol=self._to_ccxt_symbol(code),
                     timeframe=frequency_map[frequency],
                     limit=1000,
                     params=params,
@@ -260,7 +266,7 @@ class ExchangeBinance(Exchange):
 
                 # 获取K线数据
                 kline = self.exchange.fetch_ohlcv(
-                    symbol=code,
+                    symbol=self._to_ccxt_symbol(code),
                     timeframe=frequency_map[frequency],
                     limit=1000,
                     params=params,
@@ -356,7 +362,7 @@ class ExchangeBinance(Exchange):
             params["endTime"] = end_date
 
         kline = self.exchange.fetch_ohlcv(
-            symbol=code,
+            symbol=self._to_ccxt_symbol(code),
             timeframe=frequency_map[frequency],
             limit=1000,
             params=params,
@@ -378,7 +384,7 @@ class ExchangeBinance(Exchange):
 
     def ticks(self, codes: List[str]) -> Dict[str, Tick]:
         res_ticks = {}
-        _ts = self.exchange.fetch_tickers(codes)
+        _ts = self.exchange.fetch_tickers([self._to_ccxt_symbol(c) for c in codes])
         for _s, _t in _ts.items():
             if _t["last"] is None:
                 continue
@@ -415,13 +421,13 @@ class ExchangeBinance(Exchange):
     def positions(self, code: str = ""):
         try:
             position = self.exchange.fetch_positions(
-                symbols=[code] if code != "" else None
+                symbols=[self._to_ccxt_symbol(code)] if code != "" else None
             )
         except Exception as e:
             if "precision" in str(e):
                 self.__init__()
                 position = self.exchange.fetch_positions(
-                    symbols=[code] if code != "" else None
+                    symbols=[self._to_ccxt_symbol(code)] if code != "" else None
                 )
             else:
                 raise e
@@ -445,7 +451,7 @@ class ExchangeBinance(Exchange):
 
     # 撤销所有挂单
     def cancel_all_order(self, code):
-        self.exchange.cancel_all_orders(symbol=code)
+        self.exchange.cancel_all_orders(symbol=self._to_ccxt_symbol(code))
         return True
 
     def order(self, code: str, o_type: str, amount: float, args=None):
@@ -456,9 +462,9 @@ class ExchangeBinance(Exchange):
             "close_short": {"side": "BUY", "positionSide": "SHORT"},
         }
         if "open" in o_type:
-            self.exchange.set_leverage(args["leverage"], symbol=code)
+            self.exchange.set_leverage(args["leverage"], symbol=self._to_ccxt_symbol(code))
         return self.exchange.create_order(
-            symbol=code,
+            symbol=self._to_ccxt_symbol(code),
             type="MARKET",
             side=trade_maps[o_type]["side"],
             amount=amount,

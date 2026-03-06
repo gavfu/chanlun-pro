@@ -171,3 +171,8 @@ src/cl_vnpy/.vntrader
 src/cl_myquant/gmcache
 # 无用的排除
 /my_debug
+
+# 证书
+web/chanlun_chart/*.crt
+web/chanlun_chart/*.key
+web/chanlun_chart/*.p12

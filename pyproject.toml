@@ -24,7 +24,7 @@ dependencies = [
     "mytt>=2.9.3",
     "numpy==1.26.4",
     "openai>=1.84.0",
-    "openctp-ctp>=6.7.11.0",
+    "openctp-ctp>=6.7.11.0; sys_platform != 'darwin'",
     "pandas==2.1.0",
     "pinyin>=0.4.0",
     "playwright>=1.53.0",
@@ -42,7 +42,7 @@ dependencies = [
     "scipy>=1.15.3",
     "setuptools>=80.9.0",
     "sqlalchemy>=2.0.41",
-    "ta-lib",
+    "ta-lib>=0.5.0",
     "tenacity>=9.1.2",
     "tornado>=6.5.1",
     "tqdm>=4.67.1",
@@ -50,7 +50,6 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-ta-lib = { path = "package/ta_lib-0.4.25-cp311-cp311-win_amd64.whl" }
 pytdx = { path = "package/pytdx-1.72r2-py3-none-any.whl" }
 
 [[tool.uv.index]]

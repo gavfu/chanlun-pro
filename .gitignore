@@ -176,3 +176,6 @@ src/cl_myquant/gmcache
 web/chanlun_chart/*.crt
 web/chanlun_chart/*.key
 web/chanlun_chart/*.p12
+
+# notebook 导出的 HTML
+notebook/*.html

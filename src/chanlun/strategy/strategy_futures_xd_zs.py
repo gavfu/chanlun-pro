@@ -63,6 +63,9 @@ class StrategyFuturesXDZS(Strategy):
             # 后续向上笔不超过 顶特征序列分型的第三元素高点，做空
             if (
                 high_bi.type == "up"
+                and high_xd.ding_fx is not None
+                and high_xd.ding_fx.xls
+                and high_xd.ding_fx.xls[-1] is not None
                 and high_bi.high < high_xd.ding_fx.xls[-1].max
                 and self.bi_td(high_bi, high_data)
             ):
@@ -89,6 +92,9 @@ class StrategyFuturesXDZS(Strategy):
             # 后续向下笔不超过 底特征序列分型的第三元素低点，做多
             if (
                 high_bi.type == "down"
+                and high_xd.di_fx is not None
+                and high_xd.di_fx.xls
+                and high_xd.di_fx.xls[-1] is not None
                 and high_bi.low > high_xd.di_fx.xls[-1].min
                 and self.bi_td(high_bi, high_data)
             ):

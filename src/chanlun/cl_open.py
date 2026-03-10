@@ -76,8 +76,10 @@ class CL(ICL):
         if isinstance(bi_split_k_cross, str):
             parts = bi_split_k_cross.split(",")
             self.bi_split_k_cross_nums = int(parts[0])
+            self.bi_split_k_cross_tolerance = int(parts[1]) if len(parts) > 1 else 1
         else:
             self.bi_split_k_cross_nums = int(bi_split_k_cross)
+            self.bi_split_k_cross_tolerance = 1
 
         # 分型严格处理
         self.allow_bi_fx_strict = int(self.cl_config.get("allow_bi_fx_strict", 1))
@@ -128,7 +130,7 @@ class CL(ICL):
 
         self.zs_qj = self.cl_config.get("zs_qj", Config.ZS_QJ_DD.value)
         self.zs_cd = self.cl_config.get("zs_cd", Config.ZS_CD_THREE.value)
-        self.zs_wzgx = self.cl_config.get("zs_wzgx", Config.ZS_WZGX_GD.value)
+        self.zs_wzgx = self.cl_config.get("zs_wzgx", Config.ZS_WZGX_ZGGDD.value)
 
         # ---- 买卖点开关 ----
         self.cl_mmd_cal_qs_1mmd = int(self.cl_config.get("cl_mmd_cal_qs_1mmd", 1))
@@ -555,19 +557,23 @@ class CL(ICL):
                     prev = merged[-2]
                     direction = "up" if last.h >= prev.h else "down"
                 else:
-                    direction = "up"
+                    # 第一段包含时，用当前与上一根高点关系推断方向
+                    direction = "up" if ck.h > last.h else "down"
 
                 # 合并
                 if direction == "up":
                     new_h = max(last.h, ck.h)
                     new_l = max(last.l, ck.l)
+                    # k_index 取提供最高 h 的原始K线（与pyarmor一致）
+                    if ck.h > last.h:
+                        last.k_index = ck.k_index
                 else:
                     new_h = min(last.h, ck.h)
                     new_l = min(last.l, ck.l)
+                    # k_index 取提供最低 l 的原始K线（与pyarmor一致）
+                    if ck.l < last.l:
+                        last.k_index = ck.k_index
 
-                # 当新K线包含旧K线时，更新k_index为新K线的索引（与pyarmor行为一致）
-                if ck.h >= last.h and ck.l <= last.l:
-                    last.k_index = ck.k_index
                 last.h = new_h
                 last.l = new_l
                 last.n += 1
@@ -765,13 +771,11 @@ class CL(ICL):
         if len(fxs) < 2:
             return bis
 
-        # 建立 fxs 的索引映射，方便从某个 fx 快速找到其在 fxs 中的位置
-        fx_pos = {id(fx): idx for idx, fx in enumerate(fxs)}
-
         start_fx = fxs[0]
         start_idx = 0  # start_fx 在 fxs 中的索引
         end_fx = None
         end_idx = -1
+        has_confirmed_bi = False
 
         i = 1
         while i < len(fxs):
@@ -780,13 +784,14 @@ class CL(ICL):
             if end_fx is None:
                 # 还没有候选 end_fx
                 if cur_fx.type == start_fx.type:
-                    # 同类型：更新 start_fx 为更优的
-                    if start_fx.type == "ding" and cur_fx.val > start_fx.val:
-                        start_fx = cur_fx
-                        start_idx = i
-                    elif start_fx.type == "di" and cur_fx.val < start_fx.val:
-                        start_fx = cur_fx
-                        start_idx = i
+                    # 同类型：仅在首笔确认前更新 start_fx 为更优的
+                    if not has_confirmed_bi:
+                        if start_fx.type == "ding" and cur_fx.val > start_fx.val:
+                            start_fx = cur_fx
+                            start_idx = i
+                        elif start_fx.type == "di" and cur_fx.val < start_fx.val:
+                            start_fx = cur_fx
+                            start_idx = i
                 else:
                     # 反类型：检查成笔条件
                     if self._bi_fx_valid(start_fx, cur_fx):
@@ -813,10 +818,10 @@ class CL(ICL):
                     # 检查能否从 end_fx 出发形成下一笔
                     confirm = self._bi_fx_valid(end_fx, cur_fx)
                     # 次高低检查
-                    if confirm and self.bi_fx_cgd == Config.BI_FX_CHD_YES.value:
+                    if confirm and self.bi_fx_cgd == Config.BI_FX_CHD_NO.value:
                         k_gap_confirm = cur_fx.k.k_index - end_fx.k.k_index
                         if k_gap_confirm < self.fx_check_k_nums:
-                            # 检查1: 确认分型(cur_fx)是否为 end_fx~cur_fx 之间的次高低
+                            # 确认分型(cur_fx)是否为 end_fx~cur_fx 之间的次高低
                             for j in range(end_idx + 1, i):
                                 mid_fx = fxs[j]
                                 if mid_fx.type == cur_fx.type:
@@ -837,16 +842,16 @@ class CL(ICL):
                             default_zs_type=self.default_bi_zs_type,
                         )
                         bis.append(bi)
+                        has_confirmed_bi = True
                         # end_fx 成为新的 start_fx
                         start_fx = end_fx
                         start_idx = end_idx
                         end_fx = None
                         end_idx = -1
-                        # 从 start_fx 的下一个分型继续（即 i 不变，回到循环开头重新检查 cur_fx）
+                        # 从 start_fx 的下一个分型继续
                         i = start_idx + 1
                     else:
                         # 不能成笔 → 忽略，继续扫描
-                        # 注意：这里不做笔破坏检查，因为已有合法 end_fx
                         i += 1
 
         # 处理最后一个未确认的笔
@@ -880,12 +885,12 @@ class CL(ICL):
             if k_gap < 4:
                 return False
         else:
-            # bi_type_old等旧笔规则：仅检查原始K线间隔，不应用严格检查
-            if k_gap < 4:
+            # bi_type_old等旧笔规则：最小间隔按缠论K线间隔判断
+            # 通过后继续走下方严格检查逻辑
+            if cl_gap < 4:
                 return False
-            return True
 
-        # 当原始K线间距未超过检查阈值时，应用严格检查（仅用于非bi_type_old的类型）
+        # 当原始K线间距未超过检查阈值时，应用严格检查
         if k_gap < self.fx_check_k_nums:
             # 分型严格处理（使用分型区间的高低点）
             if self.allow_bi_fx_strict:
@@ -910,25 +915,27 @@ class CL(ICL):
 
     def _bi_special_bi_split(self, bis: List[BI]) -> List[BI]:
         """
-        笔拆分：当一笔内分型交叉（重叠）数量达到阈值时，将该笔拆分为更短的子笔。
+        笔拆分：当一笔内分型交叉（重叠K线）数量达到阈值时，将该笔拆分为三段子笔。
 
-        逻辑：
-        1. 遍历每笔内部的分型对，统计相邻分型区间重叠（交叉）的数量
-        2. 当交叉数达到 bi_split_k_cross_nums（默认20）时，在该位置拆分
-        3. 对于下降笔，分成：
-           [下降 start→lowest_di, 上升 lowest_di→split_ding, 下降 split_ding→end]
-        4. 对于上升笔，分成：
-           [上升 start→highest_ding, 下降 highest_ding→split_di, 上升 split_di→end]
+        算法：
+        1. 取笔内部分型（不含起止），构成连续三元组
+        2. 对每个三元组，遍历从第一个分型到笔终点之间的原始K线
+        3. 若一根K线同时与三元组中所有三个分型的区间重叠，则计为一次交叉命中
+        4. 允许最多 tolerance (默认1) 根连续未命中；超出则中断
+        5. 命中数 ≥ threshold (默认20) 时触发拆分
+        6. 拆分选点：按值排序遍历 (di, ding) 对，取第一个使三段子笔均合法的组合
         """
         if self.bi_split_k_cross_nums <= 0:
             return bis
 
         qj = self.fx_qj
         qy = self.fx_qy
+        threshold = self.bi_split_k_cross_nums
+        tolerance = self.bi_split_k_cross_tolerance
 
         result: List[BI] = []
         for bi in bis:
-            split_bis = self._try_split_bi(bi, qj, qy)
+            split_bis = self._try_split_bi(bi, qj, qy, threshold, tolerance)
             result.extend(split_bis)
 
         # 重建索引
@@ -936,108 +943,144 @@ class CL(ICL):
             b.index = i
         return result
 
-    def _try_split_bi(self, bi: BI, qj: str, qy: str) -> List[BI]:
+    def _try_split_bi(self, bi: BI, qj: str, qy: str,
+                      threshold: int, tolerance: int) -> List[BI]:
         """尝试拆分单笔，返回拆分后的笔列表（可能不变）"""
         start_idx = bi.start.k.index
         end_idx = bi.end.k.index
 
-        # 获取笔内的所有分型（从start到end）
-        fxs_in_bi = [fx for fx in self.fxs
-                      if start_idx <= fx.k.index <= end_idx]
+        # 获取笔内部的分型（不含起止分型）
+        internal_fxs = [fx for fx in self.fxs
+                        if start_idx < fx.k.index < end_idx]
 
-        if len(fxs_in_bi) < 4:
+        if len(internal_fxs) < 3:
             return [bi]
 
-        # 统计相邻分型区间交叉数
-        cross_count = 0
-        split_fx = None
-        split_pos = -1
+        # ---- Phase 1: 交叉计数 ----
+        triggered_ti = -1
+        end_ki = bi.end.k.k_index  # 原始K线终点索引
 
-        for i in range(len(fxs_in_bi) - 1):
-            a = fxs_in_bi[i]
-            b = fxs_in_bi[i + 1]
-            ha = a.high(qj, qy)
-            la = a.low(qj, qy)
-            hb = b.high(qj, qy)
-            lb = b.low(qj, qy)
-            # 区间交叉：两个分型的高低区间有重叠
-            overlap = not (ha < lb or hb < la)
-            if overlap:
-                cross_count += 1
-                if cross_count >= self.bi_split_k_cross_nums:
-                    split_fx = b
-                    split_pos = i + 1
+        for ti in range(len(internal_fxs) - 2):
+            fx1 = internal_fxs[ti]
+            fx2 = internal_fxs[ti + 1]
+            fx3 = internal_fxs[ti + 2]
+
+            h1, l1 = fx1.high(qj, qy), fx1.low(qj, qy)
+            h2, l2 = fx2.high(qj, qy), fx2.low(qj, qy)
+            h3, l3 = fx3.high(qj, qy), fx3.low(qj, qy)
+
+            hit_count = 0
+            miss_count = 0
+
+            for ki in range(fx1.k.k_index, end_ki):
+                k = self.src_klines[ki]
+                # K线同时与三个分型区间重叠
+                if (k.h >= l1 and k.l <= h1
+                        and k.h >= l2 and k.l <= h2
+                        and k.h >= l3 and k.l <= h3):
+                    hit_count += 1
+                    miss_count = 0
+                else:
+                    miss_count += 1
+                if miss_count > tolerance:
                     break
 
-        if split_fx is None:
+            if hit_count >= threshold:
+                triggered_ti = ti
+                break
+
+        if triggered_ti < 0:
             return [bi]
 
-        # 找到拆分点，构建子笔
+        # ---- Phase 2: 拆分选点 ----
+        triplet = (internal_fxs[triggered_ti],
+                   internal_fxs[triggered_ti + 1],
+                   internal_fxs[triggered_ti + 2])
         if bi.type == "down":
-            # 下降笔：找 start 到 split_fx 之间最低的 di 作为中间点
-            lowest_di = None
-            for fx in fxs_in_bi[:split_pos + 1]:
-                if fx.type == "di":
-                    if lowest_di is None or fx.val < lowest_di.val:
-                        lowest_di = fx
-            if lowest_di is None or lowest_di.k.index == start_idx:
-                return [bi]
-
-            # 找 lowest_di 之后最高的 ding（不超过 split 区域）
-            highest_ding = None
-            for fx in fxs_in_bi:
-                if fx.k.index <= lowest_di.k.index:
-                    continue
-                if fx.k.index > end_idx:
-                    break
-                if fx.type == "ding":
-                    if highest_ding is None or fx.val > highest_ding.val:
-                        highest_ding = fx
-
-            if highest_ding is None:
-                return [bi]
-
-            # 创建三笔: down start→lowest_di, up lowest_di→highest_ding, down highest_ding→end
-            bi1 = BI(start=bi.start, end=lowest_di, _type="down",
-                     index=0, default_zs_type=bi.default_zs_type)
-            bi2 = BI(start=lowest_di, end=highest_ding, _type="up",
-                     index=1, default_zs_type=bi.default_zs_type)
-            bi3 = BI(start=highest_ding, end=bi.end, _type="down",
-                     index=2, default_zs_type=bi.default_zs_type)
-            return [bi1, bi2, bi3]
-
+            return self._select_split_down(bi, internal_fxs, triplet)
         else:
-            # 上升笔：找 start 到 split_fx 之间最高的 ding 作为中间点
-            highest_ding = None
-            for fx in fxs_in_bi[:split_pos + 1]:
-                if fx.type == "ding":
-                    if highest_ding is None or fx.val > highest_ding.val:
-                        highest_ding = fx
-            if highest_ding is None or highest_ding.k.index == start_idx:
-                return [bi]
+            return self._select_split_up(bi, internal_fxs, triplet)
 
-            # 找 highest_ding 之后最低的 di
-            lowest_di = None
-            for fx in fxs_in_bi:
-                if fx.k.index <= highest_ding.k.index:
-                    continue
-                if fx.k.index > end_idx:
-                    break
-                if fx.type == "di":
-                    if lowest_di is None or fx.val < lowest_di.val:
-                        lowest_di = fx
+    def _split_gap_ok(self, fx_a: FX, fx_b: FX) -> bool:
+        """拆分子笔间隔检查（不含严格分型检查）"""
+        cl_gap = fx_b.k.index - fx_a.k.index
+        k_gap = fx_b.k.k_index - fx_a.k.k_index
+        if self.bi_type == Config.BI_TYPE_DD.value:
+            return cl_gap >= 1
+        else:
+            return k_gap >= 4
 
-            if lowest_di is None:
-                return [bi]
+    def _find_split1_from_triplet(self, bi, triplet, split1_type):
+        """从触发三元组中选取 split1 分型"""
+        # 仅从三元组内选取 split1 类型的候选
+        candidates = [fx for fx in triplet if fx.type == split1_type]
+        # 按位置排序
+        candidates.sort(key=lambda f: f.k.index)
+        # 优先选取满足间隔条件的第一个
+        for fx in candidates:
+            if self._split_gap_ok(bi.start, fx):
+                return fx
+        # 都不满足则取最后一个
+        return candidates[-1] if candidates else None
 
-            # 创建三笔: up start→highest_ding, down highest_ding→lowest_di, up lowest_di→end
-            bi1 = BI(start=bi.start, end=highest_ding, _type="up",
-                     index=0, default_zs_type=bi.default_zs_type)
-            bi2 = BI(start=highest_ding, end=lowest_di, _type="down",
-                     index=1, default_zs_type=bi.default_zs_type)
-            bi3 = BI(start=lowest_di, end=bi.end, _type="up",
-                     index=2, default_zs_type=bi.default_zs_type)
-            return [bi1, bi2, bi3]
+    def _find_split2(self, split1_fx, bi_end_fx, split2_type, internal_fxs):
+        """在 split1 之后选取最优 split2 分型：优先最极值（带间隔），退而首个有效"""
+        candidates = [fx for fx in internal_fxs
+                      if fx.type == split2_type and fx.k.index > split1_fx.k.index]
+        if not candidates:
+            return None
+        # 方向检查：down 的 split2 是 ding，需要 ding.val > di(split1).val
+        # up 的 split2 是 di，需要 ding(split1).val > di.val
+        if split2_type == "ding":
+            valid = [fx for fx in candidates if fx.val > split1_fx.val]
+        else:
+            valid = [fx for fx in candidates if split1_fx.val > fx.val]
+        if not valid:
+            return None
+        # 在满足间隔条件的候选中找最极值
+        gap_ok = [fx for fx in valid
+                  if self._split_gap_ok(split1_fx, fx)]
+        if gap_ok:
+            if split2_type == "ding":
+                return max(gap_ok, key=lambda f: f.val)
+            else:
+                return min(gap_ok, key=lambda f: f.val)
+        # 无 gap 合格候选，取首个有效
+        return valid[0]
+
+    def _select_split_down(self, bi: BI, internal_fxs: List[FX],
+                           triplet: tuple) -> List[BI]:
+        """下降笔拆分选点：start(ding)→di_fx→ding_fx→end(di)"""
+        di_fx = self._find_split1_from_triplet(bi, triplet, "di")
+        if di_fx is None:
+            return [bi]
+        ding_fx = self._find_split2(di_fx, bi.end, "ding", internal_fxs)
+        if ding_fx is None:
+            return [bi]
+        bi1 = BI(start=bi.start, end=di_fx, _type="down",
+                 index=0, default_zs_type=bi.default_zs_type)
+        bi2 = BI(start=di_fx, end=ding_fx, _type="up",
+                 index=1, default_zs_type=bi.default_zs_type)
+        bi3 = BI(start=ding_fx, end=bi.end, _type="down",
+                 index=2, default_zs_type=bi.default_zs_type)
+        return [bi1, bi2, bi3]
+
+    def _select_split_up(self, bi: BI, internal_fxs: List[FX],
+                         triplet: tuple) -> List[BI]:
+        """上升笔拆分选点：start(di)→ding_fx→di_fx→end(ding)"""
+        ding_fx = self._find_split1_from_triplet(bi, triplet, "ding")
+        if ding_fx is None:
+            return [bi]
+        di_fx = self._find_split2(ding_fx, bi.end, "di", internal_fxs)
+        if di_fx is None:
+            return [bi]
+        bi1 = BI(start=bi.start, end=ding_fx, _type="up",
+                 index=0, default_zs_type=bi.default_zs_type)
+        bi2 = BI(start=ding_fx, end=di_fx, _type="down",
+                 index=1, default_zs_type=bi.default_zs_type)
+        bi3 = BI(start=di_fx, end=bi.end, _type="up",
+                 index=2, default_zs_type=bi.default_zs_type)
+        return [bi1, bi2, bi3]
 
     def _update_bi_highlow(self):
         """更新每笔的 high/low 值"""
@@ -1241,10 +1284,10 @@ class CL(ICL):
         使用特征序列方法构建线段。
 
         算法：
-        1. 确定初始线段方向
+        1. 通过特征序列分型确定初始线段方向和起始位置
         2. 取与线段方向相反的笔作为特征序列元素
         3. 对特征序列做方向感知的包含处理（OLD⊃NEW合并，NEW⊃OLD保留但标记line_bad）
-        4. 在合并后的特征序列中寻找序列分型（跳过line_bad的中间元素）
+        4. 在合并后的特征序列中寻找序列分型（包含line_bad的中间元素）
         5. 序列分型确认 → 线段结束
         """
         if len(bis) < 3:
@@ -1253,22 +1296,7 @@ class CL(ICL):
         xds: List[XD] = []
 
         # 确定第一段方向和起始位置
-        # 如果第一笔是DOWN但第二笔UP创新高，则第一段是DOWN从bi[1]的高点开始
-        first_bi = bis[0]
-        xd_type = first_bi.type
-        start_bi_idx = 0
-
-        if len(bis) >= 2:
-            if first_bi.type == "down" and bis[1].type == "up":
-                if bis[1].high > first_bi.high:
-                    # bi[1] UP创新高 → 真正的顶在bi[1]，DOWN段从bi[2]开始
-                    xd_type = "down"
-                    start_bi_idx = 2
-            elif first_bi.type == "up" and bis[1].type == "down":
-                if bis[1].low < first_bi.low:
-                    # bi[1] DOWN创新低 → 真正的底在bi[1]，UP段从bi[2]开始
-                    xd_type = "up"
-                    start_bi_idx = 2
+        xd_type, start_bi_idx = self._find_first_xd_start(bis)
 
         while start_bi_idx < len(bis):
             result = self._find_xd_end(bis, start_bi_idx, xd_type)
@@ -1276,6 +1304,9 @@ class CL(ICL):
                 # 无法找到线段结束点，把剩余笔作为最后一段（未完成）
                 if start_bi_idx < len(bis) - 2:
                     end_bi_idx = len(bis) - 1
+                    # 未完成线段的 end_bi 应与线段方向一致
+                    if bis[end_bi_idx].type != xd_type:
+                        end_bi_idx -= 1
                     xd = self._create_xd(
                         bis, start_bi_idx, end_bi_idx, xd_type, len(xds), done=False
                     )
@@ -1297,10 +1328,559 @@ class CL(ICL):
             else:
                 start_bi_idx += 1
 
+        # 线段拆分后处理
+        xds = self._split_xds(xds, bis)
+
         return xds
 
+    def _build_zs_in_range(self, bis: List[BI], start_idx: int, end_idx: int) -> list:
+        """在一段 BI 范围内构建中枢列表"""
+        seg_bis = bis[start_idx:end_idx + 1]
+        zs_list = []
+        i = 0
+        while i < len(seg_bis) - 2:
+            bi1 = seg_bis[i]
+            bi2 = seg_bis[i + 1]
+            bi3 = seg_bis[i + 2]
+            zg = min(bi1.high, bi2.high, bi3.high)
+            zd = max(bi1.low, bi2.low, bi3.low)
+            if zg > zd:
+                gg = max(bi1.high, bi2.high, bi3.high)
+                dd = min(bi1.low, bi2.low, bi3.low)
+                zs_type = "up" if bi1.type == "down" else "down"
+                lines = [bi1, bi2, bi3]
+                j = i + 3
+                while j < len(seg_bis):
+                    bj = seg_bis[j]
+                    if bj.low < zg and bj.high > zd:
+                        lines.append(bj)
+                        gg = max(gg, bj.high)
+                        dd = min(dd, bj.low)
+                        j += 1
+                    else:
+                        break
+                zs_list.append({
+                    'start_bi': bi1.index,
+                    'end_bi': lines[-1].index,
+                    'zg': zg, 'zd': zd, 'gg': gg, 'dd': dd,
+                    'type': zs_type,
+                    'line_num': len(lines),
+                    'start_list_idx': start_idx + i,
+                    'end_list_idx': start_idx + i + len(lines) - 1,
+                })
+                i = j
+            else:
+                i += 1
+        return zs_list
+
+    def _split_xds(self, xds: List[XD], bis: List[BI]) -> List[XD]:
+        """
+        线段拆分后处理。
+        检查每个线段内是否需要拆分，基于以下条件：
+        1. 段内中枢线段超过阈值 (xd_allow_split_zs_more_line)
+        2. 段内不同向中枢 (xd_allow_split_zs_no_direction)
+        3. 笔破坏
+        """
+        result = []
+        for xd in xds:
+            splits = self._check_xd_split(xd, bis)
+            if splits:
+                result.extend(splits)
+            else:
+                result.append(xd)
+
+        # 合并连续同向线段（拆分可能导致子段方向与下一段冲突）
+        i = 0
+        while i < len(result) - 1:
+            if result[i].type == result[i + 1].type:
+                result[i].end_line = result[i + 1].end_line
+                result[i].high = max(result[i].high, result[i + 1].high)
+                result[i].low = min(result[i].low, result[i + 1].low)
+                result.pop(i + 1)
+            else:
+                i += 1
+
+        # 重新编号
+        for i, xd in enumerate(result):
+            xd.index = i
+
+        return result
+
+    def _check_xd_split(self, xd: XD, bis: List[BI]) -> Union[List[XD], None]:
+        """
+        检查单个线段是否需要拆分，返回拆分后的线段列表或 None。
+        """
+        # 只拆分已完成的线段
+        if not xd.done:
+            return None
+
+        start_idx = xd.start_line.index
+        end_idx = xd.end_line.index
+        bi_count = end_idx - start_idx + 1
+
+        if bi_count < 5:
+            return None
+
+        # 构建段内中枢
+        zs_list = self._build_zs_in_range(bis, start_idx, end_idx)
+        if not zs_list:
+            return None
+
+        same_dir_zs = [zs for zs in zs_list if zs['type'] == xd.type]
+        opp_dir_zs = [zs for zs in zs_list if zs['type'] != xd.type]
+
+        # 检查条件1: 段内中枢线段超过阈值（任何方向）
+        if self.xd_allow_split_zs_more_line:
+            for zs in zs_list:
+                if zs['line_num'] >= self.xd_zs_max_lines_split:
+                    split_result = self._split_by_long_zs(xd, bis, zs_list, zs)
+                    if split_result:
+                        return split_result
+
+        # 检查条件2: 段内不同向中枢（需要: 无同向中枢, 中枢不覆盖整段, 段内有笔破坏, 且段至少7笔）
+        if self.xd_allow_split_zs_no_direction and opp_dir_zs and not same_dir_zs and bi_count >= 7:
+            for zs in opp_dir_zs:
+                # 中枢必须不覆盖整个线段
+                if zs['start_list_idx'] > start_idx or zs['end_list_idx'] < end_idx:
+                    # 还需要段内存在笔破坏
+                    if self._has_bi_pohuai_in_range(bis, start_idx, end_idx, xd.type):
+                        split_result = self._split_by_opposite_zs(xd, bis, zs)
+                        if split_result:
+                            return split_result
+
+        return None
+
+    def _has_bi_pohuai_in_range(self, bis: List[BI], start_idx: int, end_idx: int, xd_type: str) -> bool:
+        """检查范围内是否存在笔破坏（反向笔超过前一反向笔）"""
+        seg_bis = bis[start_idx:end_idx + 1]
+        for i in range(2, len(seg_bis)):
+            b = seg_bis[i]
+            prev_same = None
+            for k in range(i - 2, -1, -1):
+                if seg_bis[k].type == b.type:
+                    prev_same = seg_bis[k]
+                    break
+            if prev_same is None:
+                continue
+            if xd_type == "down" and b.type == "up" and b.high > prev_same.high:
+                return True
+            elif xd_type == "up" and b.type == "down" and b.low < prev_same.low:
+                return True
+        return False
+
+    def _split_by_long_zs(self, xd: XD, bis: List[BI], zs_list: list, long_zs: dict) -> Union[List[XD], None]:
+        """
+        根据超长中枢拆分线段。
+        策略：找到中枢内第一个笔破坏点作为拆分位置。
+        """
+        start_idx = xd.start_line.index
+        end_idx = xd.end_line.index
+
+        split_points = []
+
+        zs_start = long_zs['start_list_idx']
+        zs_end = long_zs['end_list_idx']
+
+        # 如果有前置中枢，在前置中枢结束位置拆分
+        for zs in zs_list:
+            if zs is long_zs:
+                continue
+            if zs['end_list_idx'] < zs_start:
+                split_bi = zs['end_list_idx']
+                split_points.append(split_bi)
+                break
+
+        if not split_points:
+            # 如果中枢方向与段方向相反且覆盖整段
+            if long_zs['type'] != xd.type and zs_start == start_idx and zs_end == end_idx:
+                # 检查是否有反向笔突破段起始值（UP 段检查 DOWN 笔低于起始 low，DOWN 段检查 UP 笔高于起始 high）
+                seg_bis = bis[start_idx:end_idx + 1]
+                start_bi = seg_bis[0]
+                bi_pohuai_idx = None
+                for i in range(2, len(seg_bis)):
+                    b = seg_bis[i]
+                    if xd.type == "up" and b.type == "down" and b.low < start_bi.low:
+                        bi_pohuai_idx = start_idx + i - 1
+                        break
+                    elif xd.type == "down" and b.type == "up" and b.high > start_bi.high:
+                        bi_pohuai_idx = start_idx + i - 1
+                        break
+                if bi_pohuai_idx is not None and bi_pohuai_idx > start_idx:
+                    split_points.append(bi_pohuai_idx)
+                else:
+                    # 无反向笔突破段起始值，视为非标准线段，在首笔拆分
+                    split_points.append(start_idx)
+            else:
+                # 在中枢范围内寻找第一个笔破坏点（相对前一同向笔）
+                seg_bis = bis[zs_start:zs_end + 1]
+                bi_pohuai_idx = None
+                for i in range(2, len(seg_bis)):
+                    b = seg_bis[i]
+                    prev_same = None
+                    for k in range(i - 2, -1, -1):
+                        if seg_bis[k].type == b.type:
+                            prev_same = seg_bis[k]
+                            break
+                    if prev_same is None:
+                        continue
+                    if xd.type == "up" and b.type == "down" and b.low < prev_same.low:
+                        bi_pohuai_idx = zs_start + i - 1
+                        break
+                    elif xd.type == "down" and b.type == "up" and b.high > prev_same.high:
+                        bi_pohuai_idx = zs_start + i - 1
+                        break
+
+                if bi_pohuai_idx is not None and bi_pohuai_idx > start_idx:
+                    split_points.append(bi_pohuai_idx)
+                elif zs_start > start_idx:
+                    # 没有笔破坏但中枢不从段开头开始
+                    split_points.append(zs_start - 1)
+                else:
+                    # 中枢从段开头开始且无笔破坏，使用第一笔拆分
+                    split_points.append(start_idx)
+
+        if not split_points:
+            return None
+
+        # 使用拆分点创建新线段
+        result = self._create_split_segments(
+            xd, bis, split_points, '段内中枢线段超过11'
+        )
+
+        # 对拆分后的段继续检查笔破坏
+        if result:
+            result = self._check_bi_pohuai_splits(result, bis)
+
+        return result
+
+    def _split_by_opposite_zs(self, xd: XD, bis: List[BI], opp_zs: dict) -> Union[List[XD], None]:
+        """
+        根据段内不同向中枢拆分线段。
+        在中枢边界处拆分。
+        """
+        start_idx = xd.start_line.index
+        end_idx = xd.end_line.index
+
+        # 寻找笔破坏点作为拆分点
+        seg_bis = bis[start_idx:end_idx + 1]
+        split_bi_idx = None
+
+        for i in range(2, len(seg_bis)):
+            b = seg_bis[i]
+            if i >= 2:
+                # 检查笔破坏：同向笔超过前一同向笔
+                prev_same = None
+                for k in range(i - 2, -1, -1):
+                    if seg_bis[k].type == b.type:
+                        prev_same = seg_bis[k]
+                        break
+                if prev_same is not None:
+                    if xd.type == "up" and b.type == "down" and b.low < prev_same.low:
+                        # 下跌方向的笔破坏，在此之前拆分
+                        split_bi_idx = start_idx + i - 1
+                        break
+                    elif xd.type == "down" and b.type == "up" and b.high > prev_same.high:
+                        # 上涨方向的笔破坏，在此之前拆分
+                        split_bi_idx = start_idx + i - 1
+                        break
+
+        if split_bi_idx is None:
+            # 没有笔破坏点，在中枢开始处拆分
+            zs_start = opp_zs['start_list_idx']
+            if zs_start > start_idx:
+                split_bi_idx = zs_start - 1
+            else:
+                # 中枢从线段开始就存在，使用第一个BI作为拆分
+                split_bi_idx = start_idx
+
+        split_points = [split_bi_idx]
+
+        result = self._create_split_segments(
+            xd, bis, split_points, '段内不同向中枢拆分'
+        )
+
+        # 对拆分后的段继续检查笔破坏
+        if result:
+            result = self._check_bi_pohuai_splits(result, bis)
+
+        return result
+
+    def _split_by_bi_pohuai(self, xd: XD, bis: List[BI]) -> Union[List[XD], None]:
+        """
+        纯笔破坏拆分：在第一个笔破坏点拆分。
+        用于段内笔数较多但不满足中枢拆分条件的情况。
+        最少需要 4 笔（2 个同向笔才能比较）。
+        """
+        start_idx = xd.start_line.index
+        end_idx = xd.end_line.index
+        seg_bis = bis[start_idx:end_idx + 1]
+
+        # 寻找第一个笔破坏点
+        for i in range(2, len(seg_bis)):
+            b = seg_bis[i]
+            prev_same = None
+            for k in range(i - 2, -1, -1):
+                if seg_bis[k].type == b.type:
+                    prev_same = seg_bis[k]
+                    break
+            if prev_same is None:
+                continue
+            if xd.type == "down" and b.type == "up" and b.high > prev_same.high:
+                split_bi_idx = start_idx + i - 1
+                result = self._create_split_segments(xd, bis, [split_bi_idx], '笔破坏')
+                if result:
+                    result = self._check_bi_pohuai_splits(result, bis)
+                return result
+            elif xd.type == "up" and b.type == "down" and b.low < prev_same.low:
+                split_bi_idx = start_idx + i - 1
+                result = self._create_split_segments(xd, bis, [split_bi_idx], '笔破坏')
+                if result:
+                    result = self._check_bi_pohuai_splits(result, bis)
+                return result
+
+        return None
+
+    def _check_bi_pohuai_splits(self, xds: List[XD], bis: List[BI]) -> List[XD]:
+        """
+        检查拆分后的线段内是否有笔破坏，继续拆分。
+        """
+        result = []
+        for xd in xds:
+            split_result = self._find_bi_pohuai_split(xd, bis)
+            if split_result:
+                result.extend(split_result)
+            else:
+                result.append(xd)
+        return result
+
+    def _find_bi_pohuai_split(self, xd: XD, bis: List[BI]) -> Union[List[XD], None]:
+        """
+        在线段内寻找笔破坏拆分点。
+        策略：找到段内最极端的同向笔，在其位置拆分。
+        最少需要 4 笔。
+        """
+        start_idx = xd.start_line.index
+        end_idx = xd.end_line.index
+        if end_idx - start_idx < 3:
+            return None
+
+        seg_bis = bis[start_idx:end_idx + 1]
+
+        # DOWN 段找最低 low 的 DOWN 笔, UP 段找最高 high 的 UP 笔
+        extreme_idx = None
+        extreme_val = None
+        for i in range(len(seg_bis)):
+            b = seg_bis[i]
+            if xd.type == "down" and b.type == "down":
+                if extreme_val is None or b.low < extreme_val:
+                    extreme_val = b.low
+                    extreme_idx = start_idx + i
+            elif xd.type == "up" and b.type == "up":
+                if extreme_val is None or b.high > extreme_val:
+                    extreme_val = b.high
+                    extreme_idx = start_idx + i
+
+        if extreme_idx is not None and extreme_idx > start_idx and extreme_idx < end_idx:
+            return self._create_split_segments(
+                xd, bis, [extreme_idx], '笔破坏'
+            )
+
+        return None
+
+    def _create_split_segments(
+        self, orig_xd: XD, bis: List[BI], split_points: List[int], reason: str
+    ) -> Union[List[XD], None]:
+        """
+        根据拆分点列表创建拆分后的线段。
+        split_points: 拆分点的 BI index（每个拆分点是前一段的最后一个 BI）
+        """
+        start_idx = orig_xd.start_line.index
+        end_idx = orig_xd.end_line.index
+
+        # 构建区间列表
+        boundaries = [start_idx] + [sp + 1 for sp in split_points] + [end_idx + 1]
+        segments = []
+
+        xd_type = orig_xd.type
+        for k in range(len(boundaries) - 1):
+            seg_start = boundaries[k]
+            seg_end = boundaries[k + 1] - 1
+
+            if seg_start >= len(bis) or seg_end >= len(bis) or seg_start > seg_end:
+                continue
+
+            # 确定方向：交替方向
+            if k > 0:
+                xd_type = "down" if segments[-1].type == "up" else "up"
+
+            xd = self._create_split_xd(
+                bis, seg_start, seg_end, xd_type, len(segments), reason
+            )
+            if xd is not None:
+                segments.append(xd)
+
+        if len(segments) >= 2:
+            return segments
+        return None
+
+    def _create_split_xd(
+        self, bis: List[BI], start_bi_idx: int, end_bi_idx: int,
+        xd_type: str, index: int, reason: str
+    ) -> Union[XD, None]:
+        """创建拆分后的线段对象（允许单一笔线段）"""
+        if start_bi_idx >= len(bis) or end_bi_idx >= len(bis):
+            return None
+
+        start_bi = bis[start_bi_idx]
+        end_bi = bis[end_bi_idx]
+
+        ding_fx = XLFX(
+            _type="ding",
+            xl=TZXL("up", end_bi if xd_type == "up" else start_bi, start_bi, False, True),
+            xls=[None, TZXL("up", end_bi if xd_type == "up" else start_bi, start_bi, False, True), None],
+            done=True,
+        )
+        di_fx = XLFX(
+            _type="di",
+            xl=TZXL("down", end_bi if xd_type == "down" else start_bi, start_bi, False, True),
+            xls=[None, TZXL("down", end_bi if xd_type == "down" else start_bi, start_bi, False, True), None],
+            done=True,
+        )
+
+        xd = XD(
+            start=start_bi.start if xd_type == "up" else start_bi.start,
+            end=end_bi.end,
+            start_line=start_bi,
+            end_line=end_bi,
+            _type=xd_type,
+            ding_fx=ding_fx,
+            di_fx=di_fx,
+            index=index,
+            default_zs_type=self.default_xd_zs_type,
+        )
+        xd.done = True
+        xd.is_split = reason
+
+        # 设置高低点
+        xd.high = max(bis[j].high for j in range(start_bi_idx, end_bi_idx + 1))
+        xd.low = min(bis[j].low for j in range(start_bi_idx, end_bi_idx + 1))
+
+        return xd
+
+    def _find_first_xd_start(self, bis: List[BI]) -> Tuple[str, int]:
+        """
+        确定第一条线段的方向和起始位置。
+
+        算法：
+        1. 在 DOWN 笔特征序列中找所有 ding FX 位置
+        2. 在 UP 笔特征序列中找第一个 di FX 位置
+        3. 对每个 ding，尝试 _find_xd_end 看是否能形成有效 DOWN 段
+        4. 对 di，尝试看是否能形成有效 UP 段
+        5. 使用第一个有效的段作为起始段
+        """
+        if len(bis) < 3:
+            return bis[0].type, 0
+
+        # 获取所有 ding 候选（DOWN 笔 char seq）
+        ding_candidates = self._find_all_tzxl_fx(bis, "down", "up", "ding")
+        # 获取所有 di 候选（UP 笔 char seq）
+        di_candidates = self._find_all_tzxl_fx(bis, "up", "down", "di")
+
+        # 合并候选并按 BI index 排序
+        candidates = []
+        for bi_idx, is_bad in ding_candidates:
+            start_idx = bi_idx if bis[bi_idx].type == "down" else (bi_idx + 1 if bi_idx + 1 < len(bis) else None)
+            if start_idx is not None:
+                candidates.append(("down", start_idx, bi_idx))
+        for bi_idx, is_bad in di_candidates:
+            start_idx = bi_idx if bis[bi_idx].type == "up" else (bi_idx + 1 if bi_idx + 1 < len(bis) else None)
+            if start_idx is not None:
+                candidates.append(("up", start_idx, bi_idx))
+
+        # 按起始位置排序
+        candidates.sort(key=lambda c: c[1])
+
+        # 尝试每个候选，找第一个能形成有效线段的
+        for xd_type, start_idx, fx_bi_idx in candidates:
+            result = self._find_xd_end(bis, start_idx, xd_type)
+            if result is not None:
+                end_bi_idx, ding_fx, di_fx, tzxls = result
+                # 验证：确认分型中间元素中没有超过起始点的笔
+                # 对 DOWN 段，di FX 中间元素不应有 high > start.high
+                # 对 UP 段，ding FX 中间元素不应有 low < start.low
+                start_bi = bis[start_idx]
+                if xd_type == "down" and di_fx and di_fx.xl:
+                    if any(l.high > start_bi.high for l in di_fx.xl.lines):
+                        continue
+                elif xd_type == "up" and ding_fx and ding_fx.xl:
+                    if any(l.low < start_bi.low for l in ding_fx.xl.lines):
+                        continue
+                return xd_type, start_idx
+
+        # 兜底：简单规则
+        first_bi = bis[0]
+        if len(bis) >= 2:
+            if first_bi.type == "down" and bis[1].type == "up":
+                if bis[1].high > first_bi.high:
+                    return "down", 2
+            elif first_bi.type == "up" and bis[1].type == "down":
+                if bis[1].low < first_bi.low:
+                    return "up", 2
+        return first_bi.type, 0
+
+    def _find_all_tzxl_fx(
+        self, bis: List[BI], bi_type: str, bh_direction: str, fx_type: str,
+    ) -> List[Tuple[int, bool]]:
+        """
+        找所有指定类型的 FX（返回列表）。
+        Returns: [(fx_middle_bi_index, is_line_bad), ...]
+        """
+        tzxl_bis = [bi for bi in bis if bi.type == bi_type]
+        if len(tzxl_bis) < 3:
+            return []
+
+        tzxls: List[TZXL] = []
+        for bi in tzxl_bis:
+            pre_line = bis[bi.index - 1] if bi.index > 0 else bi
+            new_tzxl = TZXL(
+                bh_direction=bh_direction, line=bi, pre_line=pre_line,
+                line_bad=False, done=bi.is_done(),
+            )
+            if len(tzxls) == 0:
+                tzxls.append(new_tzxl)
+                continue
+            last_tzxl = tzxls[-1]
+            old_contains_new = last_tzxl.max >= new_tzxl.max and last_tzxl.min <= new_tzxl.min
+            new_contains_old = new_tzxl.max >= last_tzxl.max and new_tzxl.min <= last_tzxl.min
+            if old_contains_new:
+                last_tzxl.lines.append(bi)
+                last_tzxl.done = bi.is_done()
+                last_tzxl.line_bad = False
+                last_tzxl.update_maxmin()
+            elif new_contains_old:
+                new_tzxl.line_bad = True
+                tzxls.append(new_tzxl)
+            else:
+                tzxls.append(new_tzxl)
+
+        if len(tzxls) < 3:
+            return []
+
+        results = []
+        for i in range(1, len(tzxls) - 1):
+            curr = tzxls[i]
+            prev = tzxls[i - 1]
+            nxt = tzxls[i + 1]
+            if fx_type == "ding" and curr.max > prev.max and curr.max > nxt.max:
+                key_bi = max(curr.lines, key=lambda l: l.high)
+                results.append((key_bi.index, curr.line_bad))
+            elif fx_type == "di" and curr.min < prev.min and curr.min < nxt.min:
+                key_bi = min(curr.lines, key=lambda l: l.low)
+                results.append((key_bi.index, curr.line_bad))
+        return results
+
     def _find_xd_end(
-        self, bis: List[BI], start_bi_idx: int, xd_type: str
+        self, bis: List[BI], start_bi_idx: int, xd_type: str,
     ) -> Union[Tuple[int, XLFX, XLFX, List[TZXL]], None]:
         """
         从 start_bi_idx 开始，寻找当前方向线段的结束位置。
@@ -1309,8 +1889,6 @@ class CL(ICL):
         - OLD⊃NEW（旧元素包含新元素）→ 合并，line_bad=False
         - NEW⊃OLD（新元素包含旧元素）→ 不合并，新元素 line_bad=True
         - 无包含 → 新元素 line_bad=False
-
-        分型检测跳过 line_bad=True 的中间元素。
 
         返回 (end_bi_idx, ding_fx, di_fx, tzxls) 或 None
         """
@@ -1321,13 +1899,8 @@ class CL(ICL):
         # 寻找的分型类型
         target_fx_type = "ding" if xd_type == "up" else "di"
 
-        # 收集反方向笔作为特征序列元素（从 start_bi_idx 之前一个反方向笔开始）
+        # 收集反方向笔作为特征序列元素
         tzxl_bis = []
-        # 特征序列需要包含 start_bi_idx 前面的反方向笔（作为 TZXL[0]）
-        for i in range(start_bi_idx - 1, -1, -1):
-            if bis[i].type == tzxl_bi_type:
-                tzxl_bis.insert(0, bis[i])
-                break
         for i in range(start_bi_idx, len(bis)):
             if bis[i].type == tzxl_bi_type:
                 tzxl_bis.append(bis[i])
@@ -1357,28 +1930,35 @@ class CL(ICL):
             new_contains_old = new_tzxl.max >= last_tzxl.max and new_tzxl.min <= last_tzxl.min
 
             if old_contains_new:
-                # OLD⊃NEW → 合并，line_bad=False（合并重置bad状态）
+                # OLD⊃NEW → 合并到旧元素
                 last_tzxl.lines.append(bi)
                 last_tzxl.done = done
                 last_tzxl.line_bad = False
                 last_tzxl.update_maxmin()
             elif new_contains_old:
-                # NEW⊃OLD → 不合并，标记 line_bad=True
+                # NEW⊃OLD → 不合并，新元素标记 line_bad=True
                 new_tzxl.line_bad = True
                 tzxls.append(new_tzxl)
             else:
                 # 无包含 → 正常添加
                 tzxls.append(new_tzxl)
 
-        # 在特征序列中寻找序列分型（跳过 line_bad 的中间元素）
+        # 在特征序列中寻找序列分型
+        # line_bad 处理规则：
+        #   - 特征序列位置较深（>= 3）的 bad FX 视为有效，直接使用
+        #   - 位置较浅的 bad FX → 暂存，继续找非 bad FX
+        #   - 遇到非 bad FX → 比较极值：
+        #     - 非 bad 更极端（ding 更高 / di 更低）→ 使用非 bad
+        #     - bad 更极端 → 使用 bad（它是真正的极值点）
+        #   - 扫描结束无非 bad → 使用 bad（后备）
         if len(tzxls) < 3:
             return None
 
+        first_bad_result = None
+        first_bad_extreme = None  # bad FX 的极值（ding=max, di=min）
+
         for i in range(1, len(tzxls) - 1):
             curr_xl = tzxls[i]
-            # 跳过 line_bad 的元素作为分型中间
-            if curr_xl.line_bad:
-                continue
 
             prev_xl = tzxls[i - 1]
             next_xl = tzxls[i + 1]
@@ -1394,46 +1974,85 @@ class CL(ICL):
             if is_fx:
                 # 检查笔破坏
                 if not self._check_xd_bi_pohuai(bis, start_bi_idx, curr_xl, xd_type):
-                    xlfx = XLFX(
-                        _type=target_fx_type,
-                        xl=curr_xl,
-                        xls=[prev_xl, curr_xl, next_xl],
-                        done=next_xl.done,
+                    result = self._build_xd_fx_result(
+                        bis, start_bi_idx, xd_type, target_fx_type,
+                        curr_xl, prev_xl, next_xl, tzxls,
                     )
+                    if result is not None:
+                        # 位置较深的 bad FX（>= 3 个前置特征序列元素）视为有效
+                        is_line_bad = curr_xl.line_bad and i < 3
+                        if is_line_bad:
+                            # bad FX → 暂存第一个，继续找非 bad
+                            if first_bad_result is None:
+                                first_bad_result = result
+                                first_bad_extreme = curr_xl.max if target_fx_type == "ding" else curr_xl.min
+                            continue
 
-                    # 确定线段结束位置
-                    if xd_type == "up":
-                        # 顶分型：找中间元素中最高的笔
-                        end_bi = max(curr_xl.lines, key=lambda l: l.high)
-                        end_bi_idx = end_bi.index
-                        # 结束笔应该是向上的
-                        if bis[end_bi_idx].type == "down" and end_bi_idx > 0:
-                            end_bi_idx -= 1
-                        ding_fx = xlfx
-                        di_fx = XLFX(
-                            _type="di",
-                            xl=tzxls[0],
-                            xls=[None, tzxls[0], tzxls[1] if len(tzxls) > 1 else None],
-                            done=True,
-                        )
-                    else:
-                        # 底分型：找中间元素中最低的笔
-                        end_bi = min(curr_xl.lines, key=lambda l: l.low)
-                        end_bi_idx = end_bi.index
-                        # 结束应在DOWN笔（底分型中间是UP笔，取其前面的DOWN笔）
-                        if bis[end_bi_idx].type == "up" and end_bi_idx > 0:
-                            end_bi_idx -= 1
-                        di_fx = xlfx
-                        ding_fx = XLFX(
-                            _type="ding",
-                            xl=tzxls[0],
-                            xls=[None, tzxls[0], tzxls[1] if len(tzxls) > 1 else None],
-                            done=True,
-                        )
+                        # 非 bad FX
+                        if first_bad_result is not None:
+                            # 比较极值：非 bad 更极端才替代 bad
+                            is_more_extreme = (
+                                (target_fx_type == "ding" and curr_xl.max > first_bad_extreme)
+                                or (target_fx_type == "di" and curr_xl.min < first_bad_extreme)
+                            )
+                            if is_more_extreme:
+                                # 非 bad 更极端 → 使用非 bad
+                                _, ding_fx, di_fx, _ = result
+                                target_xlfx = ding_fx if target_fx_type == "ding" else di_fx
+                                target_xlfx.is_line_bad = True
+                                return result
+                            else:
+                                # bad 更极端 → 使用 bad
+                                return first_bad_result
 
-                    if end_bi_idx - start_bi_idx >= 2:
-                        return (end_bi_idx, ding_fx, di_fx, tzxls)
+                        return result
 
+        # 没找到非 bad FX，回退到 bad FX
+        if first_bad_result is not None:
+            return first_bad_result
+
+        return None
+
+    def _build_xd_fx_result(
+        self, bis, start_bi_idx, xd_type, target_fx_type,
+        curr_xl, prev_xl, next_xl, tzxls,
+    ):
+        """构建 FX 结果元组"""
+        xlfx = XLFX(
+            _type=target_fx_type,
+            xl=curr_xl,
+            xls=[prev_xl, curr_xl, next_xl],
+            done=next_xl.done,
+        )
+        xlfx.is_line_bad = curr_xl.line_bad
+
+        if xd_type == "up":
+            end_bi = max(curr_xl.lines, key=lambda l: l.high)
+            end_bi_idx = end_bi.index
+            if bis[end_bi_idx].type == "down" and end_bi_idx > 0:
+                end_bi_idx -= 1
+            ding_fx = xlfx
+            di_fx = XLFX(
+                _type="di",
+                xl=tzxls[0],
+                xls=[None, tzxls[0], tzxls[1] if len(tzxls) > 1 else None],
+                done=True,
+            )
+        else:
+            end_bi = min(curr_xl.lines, key=lambda l: l.low)
+            end_bi_idx = end_bi.index
+            if bis[end_bi_idx].type == "up" and end_bi_idx > 0:
+                end_bi_idx -= 1
+            di_fx = xlfx
+            ding_fx = XLFX(
+                _type="ding",
+                xl=tzxls[0],
+                xls=[None, tzxls[0], tzxls[1] if len(tzxls) > 1 else None],
+                done=True,
+            )
+
+        if end_bi_idx - start_bi_idx >= 2:
+            return (end_bi_idx, ding_fx, di_fx, tzxls)
         return None
 
     def _check_xd_bi_pohuai(

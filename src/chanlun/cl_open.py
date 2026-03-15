@@ -1194,62 +1194,76 @@ class CL(ICL):
         return line.high, line.low
 
     def _build_zs_bz(self, lines: List[LINE], line_type: str) -> List[ZS]:
-        """标准中枢：第一段为进入段，接下来三段形成重叠区间，持续延伸"""
+        """标准中枢：进入段 + 三段重叠区间，持续延伸，共享边界
+        
+        Fix 11: 进入段模型
+        - lines[i] 为进入段，lines[i+1,i+2,i+3] 形成重叠区间
+        - zg/zd 仅由重叠区间（i+1,i+2,i+3）决定，不含进入段
+        - 进入条件：h_enter >= zd AND l_enter <= zg
+        - 进入段包含在 ZS.lines 中但不参与 gg/dd 计算
+        - gg/dd = max/min of lines[1:-1]（去除首尾）
+        - 若 done=False（数据末尾），gg/dd = max/min of lines[1:]
+        """
         if len(lines) < 4:
             return []
         zss: List[ZS] = []
         i = 0
         while i + 3 < len(lines):
-            # lines[i] 是进入段，lines[i+1],[i+2],[i+3] 形成重叠区间
+            # 重叠区间由 lines[i+1, i+2, i+3] 决定
             h1, l1 = self._get_line_zs_highlow(lines[i + 1])
             h2, l2 = self._get_line_zs_highlow(lines[i + 2])
             h3, l3 = self._get_line_zs_highlow(lines[i + 3])
             zg = min(h1, h2, h3)
             zd = max(l1, l2, l3)
             if zg > zd:
+                # 进入段条件：lines[i] 必须进入重叠区间
                 h0, l0 = self._get_line_zs_highlow(lines[i])
-                gg = max(h0, h1, h2, h3)
-                dd = min(l0, l1, l2, l3)
-                zs = ZS(
-                    zs_type=line_type,
-                    start=lines[i].start,
-                    end=lines[i + 3].end,
-                    zg=zg,
-                    zd=zd,
-                    gg=gg,
-                    dd=dd,
-                    _type="up" if lines[i].type == "down" else "down",
-                    index=len(zss),
-                    line_num=4,
-                    level=0,
-                )
-                zs.done = False
-                zs.real = True
-                for l in lines[i : i + 4]:
-                    zs.add_line(l)
-                # 延伸：后续段进入中枢区间则继续
-                j = i + 4
-                while j < len(lines):
-                    hj, lj = self._get_line_zs_highlow(lines[j])
-                    if hj >= zd and lj <= zg:
-                        zs.add_line(lines[j])
-                        zs.end = lines[j].end
-                        zs.line_num += 1
-                        zs.gg = max(zs.gg, hj)
-                        zs.dd = min(zs.dd, lj)
-                        # 根据 zs_cd 更新 zg/zd
-                        if self.zs_cd == Config.ZS_CD_MORE.value:
-                            zg = min(zg, hj)
-                            zd = max(zd, lj)
-                            zs.zg = zg
-                            zs.zd = zd
-                        j += 1
+                if h0 >= zd and l0 <= zg:
+                    # 初始线段：进入段 + 3段重叠
+                    zs_lines = [lines[i], lines[i + 1], lines[i + 2], lines[i + 3]]
+                    # 延伸：后续段进入中枢区间则继续
+                    j = i + 4
+                    while j < len(lines):
+                        hj, lj = self._get_line_zs_highlow(lines[j])
+                        if hj >= zd and lj <= zg:
+                            zs_lines.append(lines[j])
+                            # 根据 zs_cd 更新 zg/zd
+                            if self.zs_cd == Config.ZS_CD_MORE.value:
+                                zg = min(zg, hj)
+                                zd = max(zd, lj)
+                            j += 1
+                        else:
+                            break
+                    done = j < len(lines)
+                    # gg/dd：去除进入段(首)和边界段(尾)，done=False时保留末段
+                    if done and len(zs_lines) > 2:
+                        inner = zs_lines[1:-1]
                     else:
-                        break
-                zs.done = True
-                zss.append(zs)
-                # 下一个 ZS 从当前 ZS 的最后一段开始（共享边界）
-                i = j - 1
+                        inner = zs_lines[1:]
+                    gg = max(self._get_line_zs_highlow(l)[0] for l in inner)
+                    dd = min(self._get_line_zs_highlow(l)[1] for l in inner)
+                    zs = ZS(
+                        zs_type=line_type,
+                        start=zs_lines[0].start,
+                        end=zs_lines[-1].end,
+                        zg=zg,
+                        zd=zd,
+                        gg=gg,
+                        dd=dd,
+                        _type="zd",
+                        index=len(zss),
+                        line_num=len(zs_lines),
+                        level=0,
+                    )
+                    zs.done = done
+                    zs.real = True
+                    for l in zs_lines:
+                        zs.add_line(l)
+                    zss.append(zs)
+                    # 共享边界：下一个中枢从当前中枢的最后一段开始搜索
+                    i = j - 1
+                else:
+                    i += 1
             else:
                 i += 1
         return zss

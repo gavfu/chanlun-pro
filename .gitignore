@@ -179,3 +179,5 @@ web/chanlun_chart/*.p12
 
 # notebook 导出的 HTML
 notebook/*.html
+
+tests/test_data

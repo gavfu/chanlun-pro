@@ -62,12 +62,30 @@ Web UI (Flask+Tornado+TradingView) / Jupyter Notebook
 
 - ✅ K 线合并（Fix 6：k_index 取极值原始K线）
 - ✅ 分型识别（与 cl_pyarmor 完全一致）
-- ✅ 笔构建（Fix 1~5）
+- ✅ 笔构建（Fix 1~5, Fix 8: 延伸使用严格不等式 `<`/`>`）
 - ✅ 线段（XD）：全部5个测试数据集 100% 匹配
-- ✅ 笔拆分（Fix 7：`_bi_special_bi_split` 使用 k_gap，`_find_split1_from_triplet` 只用三元组候选）
-- ⚠️ 笔端点精度：少数笔的起止端点与 cl_pyarmor 有差异（BTC60: 3笔, BTC5m: 4笔），不影响线段结论，已接受
+- ✅ 笔拆分（Fix 7: k_gap 重叠检测；Fix 9: `_find_split1_from_triplet` 混合策略 — 先按位置+`_bi_fx_valid`校验，回退用极值排序）
+- ✅ MACD 指标（Fix 10: `hist = hist * 2` 对齐 talib 输出）
+- ✅ 走势段（ZSD）& 趋势走势段（QSD）：全部5个测试数据集与 cl_pyarmor 输出一致（zsds/qsds/zsd_zss/qsd_zss 均为 0/0）
+- ✅ ZSD 算法隔离验证：将 cl_pyarmor 的 XD 列表注入 cl_open，三个大数据集（BTC4h5k/ETH4h5k/BTCd3k）均与 cl_pyarmor 100% 一致（ZSD/QSD内容、ZSD_ZSS精确匹配）
+- ✅ BTC60/ETH60/BTCd 小数据集（500-1000根K线）：笔、线段完全匹配（0差异）
+- ⚠️ 大数据集端到端差异：cl_open 与 cl_pyarmor 的笔列表在大数据集上存在分歧，cl_open 在某些边界情况下比 cl_pyarmor 更早确认笔（cl_gap=4 的情况），导致后续线段、ZSD 等结果不同。已排除 cl_gap 阈值（测试 cl_gap>=5 会破坏小数据集匹配），根因为 cl_pyarmor 在确认步骤有未知的额外校验逻辑。
+- ⚠️ 笔端点精度差异数据：BTC5m 2笔, ETH5m 6笔（pre-split）；大数据集 BTC4h5k/ETH4h5k/BTCd3k 有级联差异
 
-测试数据与诊断脚本在 `tests/`（`diag_xd_all.py` 为主要对比脚本）。
+测试数据与诊断脚本在 `tests/`（`diag_xd_all.py`、`diag_zsd_all.py`、`diag_zsd_isolated.py` 为主要对比脚本）。
+
+### ZSD/QSD 实现说明
+
+`_build_zsds()` 和 `_build_qsds()` 使用与线段完全相同的特征序列算法（`_build_xds`），分别以 XD 和 ZSD 作为基本元素（LINE 接口通用）。
+
+ZSD 模式通过 `self._zsd_mode = True` 激活，在 `_find_xd_end` 内施加额外约束：
+1. **`len(tzxls) >= 5`**：走势段级别需要至少 5 个特征序列元素才能查找分型（XD 级别只需 3 个）
+2. **`prev_xl.line_bad → skip`**：前驱特征序列元素为 line_bad 时，当前分型被跳过（cl_pyarmor 行为）
+3. **`_split_xds` 跳过**：走势段不进行拆分后处理
+
+关键修正（fallback 过滤）：当 `_find_first_xd_start` 对 XD 序列找不到有效序列分型时，会触发兜底 fallback 返回 `(type, 0)`，导致生成一个 done=False 的部分走势段。cl_pyarmor 不包含此类「无有效起点」的尾部部分段，因此在 `_build_zsds`/`_build_qsds` 中过滤：若结果全为 done=False，则清空。
+
+大数据集（BTC4h5k/ETH4h5k/BTCd3k）：ZSD 算法本身 100% 正确（隔离注入 pyarmor XD 验证），端到端差异源于 XD 层面分歧，非 ZSD 算法问题。
 
 ---
 

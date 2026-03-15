@@ -3,8 +3,7 @@
 缠论核心计算 —— 开源实现 (cl_open.py)
 
 替代 PyArmor 加密的 cl.py，实现 ICL 接口。
-第一阶段：K线合并、分型、笔。
-线段/中枢/买卖点/背驰 暂返回空列表。
+已实现：K线合并、分型、笔、线段、笔中枢、线段中枢、背驰、买卖点。
 """
 import datetime
 from typing import Dict, List, Tuple, Union
@@ -443,7 +442,19 @@ class CL(ICL):
         self._calc_xd_bc()
         self._calc_xd_mmd()
 
-        # 10) 记录最后 K 线日期
+        # 10) 走势段 + 走势段中枢 + 走势段背驰 + 走势段买卖点
+        self._build_zsds()
+        self._build_zsd_zss()
+        self._calc_zsd_bc()
+        self._calc_zsd_mmd()
+
+        # 11) 趋势走势段 + 趋势走势段中枢 + 趋势走势段背驰 + 趋势走势段买卖点
+        self._build_qsds()
+        self._build_qsd_zss()
+        self._calc_qsd_bc()
+        self._calc_qsd_mmd()
+
+        # 12) 记录最后 K 线日期
         self._last_k_date = self.src_klines[-1].date
 
     def _incremental_compute(self, new_klines: pd.DataFrame):
@@ -802,13 +813,13 @@ class CL(ICL):
                 # 已有候选 end_fx
                 if cur_fx.type == end_fx.type:
                     # 同类型分型（和 end_fx 同类）
-                    if end_fx.type == "di" and cur_fx.val <= end_fx.val:
-                        # 更低/等低的底 → 延伸 end_fx（如果满足成笔条件）
+                    if end_fx.type == "di" and cur_fx.val < end_fx.val:
+                        # 更低的底 → 延伸 end_fx（如果满足成笔条件）
                         if self._bi_fx_valid(start_fx, cur_fx):
                             end_fx = cur_fx
                             end_idx = i
-                    elif end_fx.type == "ding" and cur_fx.val >= end_fx.val:
-                        # 更高/等高的顶 → 延伸 end_fx
+                    elif end_fx.type == "ding" and cur_fx.val > end_fx.val:
+                        # 更高的顶 → 延伸 end_fx
                         if self._bi_fx_valid(start_fx, cur_fx):
                             end_fx = cur_fx
                             end_idx = i
@@ -1011,17 +1022,31 @@ class CL(ICL):
             return k_gap >= 4
 
     def _find_split1_from_triplet(self, bi, triplet, split1_type):
-        """从触发三元组中选取 split1 分型"""
+        """从触发三元组中选取 split1 分型
+
+        选取策略（与 cl_pyarmor 对齐）：
+        1. 按位置顺序遍历三元组内的候选分型，选取第一个通过 _bi_fx_valid 的
+        2. 若均不通过 _bi_fx_valid，则回退：按极值排序，取第一个满足 _split_gap_ok 的
+        """
         # 仅从三元组内选取 split1 类型的候选
         candidates = [fx for fx in triplet if fx.type == split1_type]
-        # 按位置排序
-        candidates.sort(key=lambda f: f.k.index)
-        # 优先选取满足间隔条件的第一个
+        if not candidates:
+            return None
+        # 策略1: 按位置顺序，取第一个通过 _bi_fx_valid 的
+        candidates_by_pos = sorted(candidates, key=lambda f: f.k.index)
+        for fx in candidates_by_pos:
+            if self._bi_fx_valid(bi.start, fx):
+                return fx
+        # 策略2: 回退 — 按极值排序（di 取最低, ding 取最高），取第一个满足间隔的
+        if split1_type == "di":
+            candidates.sort(key=lambda f: f.val)
+        else:
+            candidates.sort(key=lambda f: f.val, reverse=True)
         for fx in candidates:
             if self._split_gap_ok(bi.start, fx):
                 return fx
-        # 都不满足则取最后一个
-        return candidates[-1] if candidates else None
+        # 都不满足则取最极值
+        return candidates[0]
 
     def _find_split2(self, split1_fx, bi_end_fx, split2_type, internal_fxs):
         """在 split1 之后选取最优 split2 分型：优先最极值（带间隔），退而首个有效"""
@@ -1381,6 +1406,12 @@ class CL(ICL):
         2. 段内不同向中枢 (xd_allow_split_zs_no_direction)
         3. 笔破坏
         """
+        # ZSD/QSD 模式：走势段不进行拆分，仅重新编号
+        if getattr(self, '_zsd_mode', False):
+            for i, xd in enumerate(xds):
+                xd.index = i
+            return xds
+
         result = []
         for xd in xds:
             splits = self._check_xd_split(xd, bis)
@@ -1951,7 +1982,10 @@ class CL(ICL):
         #     - 非 bad 更极端（ding 更高 / di 更低）→ 使用非 bad
         #     - bad 更极端 → 使用 bad（它是真正的极值点）
         #   - 扫描结束无非 bad → 使用 bad（后备）
+        # ZSD 模式额外要求：特征序列元素数量 >= 5（走势段需要更多历史确认）
         if len(tzxls) < 3:
+            return None
+        if getattr(self, '_zsd_mode', False) and len(tzxls) < 5:
             return None
 
         first_bad_result = None
@@ -1979,6 +2013,9 @@ class CL(ICL):
                         curr_xl, prev_xl, next_xl, tzxls,
                     )
                     if result is not None:
+                        # ZSD 模式：跳过前驱特征序列元素为 line_bad 的分型
+                        if getattr(self, '_zsd_mode', False) and prev_xl.line_bad:
+                            continue
                         # 位置较深的 bad FX（>= 3 个前置特征序列元素）视为有效
                         is_line_bad = curr_xl.line_bad and i < 3
                         if is_line_bad:
@@ -2202,9 +2239,13 @@ class CL(ICL):
             self._calc_line_bc(self.xds, zss, zs_type)
 
     def _calc_line_bc(
-        self, lines: List[LINE], zss: List[ZS], zs_type: str
+        self, lines: List[LINE], zss: List[ZS], zs_type: str,
+        line_bc_type: str = None,
     ):
-        """通用的线背驰计算"""
+        """通用的线背驰计算
+        
+        line_bc_type: 指定背驰类型标签（"bi"/"xd"/"zsd"/"qsd"），None 时自动判断
+        """
         from chanlun.cl_interface import compare_ld_beichi
 
         for idx in range(2, len(lines)):
@@ -2223,7 +2264,10 @@ class CL(ICL):
                     bc = compare_ld_beichi(
                         prev_same.get_ld(self), line.get_ld(self), line.type
                     )
-                    bc_type = "bi" if isinstance(line, BI) else "xd"
+                    if line_bc_type is not None:
+                        bc_type = line_bc_type
+                    else:
+                        bc_type = "bi" if isinstance(line, BI) else "xd"
                     line.add_bc(bc_type, None, prev_same, [], bc, zs_type)
 
             # 2. 盘整背驰
@@ -2267,6 +2311,117 @@ class CL(ICL):
             zss = [zs for zs in self.xd_zss if zs.zs_type == "xd"]
             for xd in self.xds:
                 user_custom_mmd(self, xd, self.xds, zs_type, zss)
+
+    # ---- 走势段构建（ZSD）----
+    def _build_zsds(self):
+        """从线段（XD）构建走势段（ZSD）
+
+        使用与线段相同的特征序列算法，以 XD 作为基本元素。
+        _build_xds 的所有内部逻辑对 LINE 接口是通用的，
+        因此可直接传入 self.xds 作为 bis 参数。
+        """
+        if len(self.xds) < 3:
+            self.zsds = []
+            return
+        self._zsd_mode = True
+        zsds = self._build_xds(self.xds)
+        self._zsd_mode = False
+        # 如果所有走势段都是未完成的（即没有找到有效的序列分型起点，仅来自兜底fallback），
+        # 则清空结果。与 cl_pyarmor 行为保持一致。
+        if not any(zsd.done for zsd in zsds):
+            zsds = []
+        self.zsds = zsds
+        self._update_zsd_highlow()
+
+    def _build_qsds(self):
+        """从走势段（ZSD）构建趋势走势段（QSD）
+
+        同上，对 ZSD 再递归一层。
+        """
+        if len(self.zsds) < 3:
+            self.qsds = []
+            return
+        self._zsd_mode = True
+        qsds = self._build_xds(self.zsds)
+        self._zsd_mode = False
+        # 同 _build_zsds：如果所有趋势走势段都是未完成的，则清空结果
+        if not any(qsd.done for qsd in qsds):
+            qsds = []
+        self.qsds = qsds
+        self._update_qsd_highlow()
+
+    def _update_zsd_highlow(self):
+        """更新走势段的高低点（根据 zsd_qj 配置）"""
+        for zsd in self.zsds:
+            if self.zsd_qj == Config.ZSD_QJ_CK.value:
+                ck_start = zsd.start.k.index
+                ck_end = zsd.end.k.index
+                zsd.high = max(ck.h for ck in self.cl_klines[ck_start : ck_end + 1])
+                zsd.low = min(ck.l for ck in self.cl_klines[ck_start : ck_end + 1])
+            elif self.zsd_qj == Config.ZSD_QJ_K.value:
+                start_k = zsd.start.k.k_index
+                end_k = zsd.end.k.k_index
+                zsd.high = max(k.h for k in self.src_klines[start_k : end_k + 1])
+                zsd.low = min(k.l for k in self.src_klines[start_k : end_k + 1])
+            # ZSD_QJ_DD: 默认使用 _create_xd 中已设置的 high/low（由 XD 的起止分型确定）
+
+    def _update_qsd_highlow(self):
+        """更新趋势走势段的高低点（复用 zsd_qj 配置）"""
+        for qsd in self.qsds:
+            if self.zsd_qj == Config.ZSD_QJ_CK.value:
+                ck_start = qsd.start.k.index
+                ck_end = qsd.end.k.index
+                qsd.high = max(ck.h for ck in self.cl_klines[ck_start : ck_end + 1])
+                qsd.low = min(ck.l for ck in self.cl_klines[ck_start : ck_end + 1])
+            elif self.zsd_qj == Config.ZSD_QJ_K.value:
+                start_k = qsd.start.k.k_index
+                end_k = qsd.end.k.k_index
+                qsd.high = max(k.h for k in self.src_klines[start_k : end_k + 1])
+                qsd.low = min(k.l for k in self.src_klines[start_k : end_k + 1])
+
+    def _build_zsd_zss(self):
+        """构建走势段中枢"""
+        all_zss = []
+        for zs_type in self.zs_xd_type:
+            zss = self._build_zs_by_type(zs_type, self.zsds, "zsd")
+            all_zss.extend(zss)
+        self.zsd_zss = all_zss
+
+    def _build_qsd_zss(self):
+        """构建趋势走势段中枢"""
+        all_zss = []
+        for zs_type in self.zs_xd_type:
+            zss = self._build_zs_by_type(zs_type, self.qsds, "qsd")
+            all_zss.extend(zss)
+        self.qsd_zss = all_zss
+
+    def _calc_zsd_bc(self):
+        """计算走势段级别的背驰"""
+        if len(self.zsds) < 3:
+            return
+        for zs_type in self.zs_xd_type:
+            zss = [zs for zs in self.zsd_zss if zs.zs_type == "zsd"]
+            self._calc_line_bc(self.zsds, zss, zs_type, line_bc_type="zsd")
+
+    def _calc_qsd_bc(self):
+        """计算趋势走势段级别的背驰"""
+        if len(self.qsds) < 3:
+            return
+        for zs_type in self.zs_xd_type:
+            zss = [zs for zs in self.qsd_zss if zs.zs_type == "qsd"]
+            self._calc_line_bc(self.qsds, zss, zs_type, line_bc_type="zsd")
+
+    def _calc_zsd_mmd(self):
+        """计算走势段级别的买卖点"""
+        for zs_type in self.zs_xd_type:
+            zss = [zs for zs in self.zsd_zss if zs.zs_type == "zsd"]
+            self._calc_line_mmd(self.zsds, zss, zs_type)
+
+    def _calc_qsd_mmd(self):
+        """计算趋势走势段级别的买卖点"""
+        for zs_type in self.zs_xd_type:
+            zss = [zs for zs in self.qsd_zss if zs.zs_type == "qsd"]
+            self._calc_line_mmd(self.qsds, zss, zs_type)
 
     def _calc_line_mmd(
         self, lines: List[LINE], zss: List[ZS], zs_type: str
@@ -2432,6 +2587,8 @@ class CL(ICL):
         dif = np.nan_to_num(dif, nan=0.0)
         dea = np.nan_to_num(dea, nan=0.0)
         hist = np.nan_to_num(hist, nan=0.0)
+        # talib MACD hist = dif - dea，缠论通用写法为 2*(dif-dea)
+        hist = hist * 2
 
         self.idx = {
             "macd": {
